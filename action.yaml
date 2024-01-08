@@ -39,6 +39,8 @@ runs:
             for (const issue of issues) {
               console.log(`Processing issue https://github.com/${context.repo.owner}/${context.repo.repo}/issues/${issue.number}`);
 
+              let perBugData = {};
+
               // Paginate through comments for the specific issue
               for await (const { data: comments } of github.paginate.iterator(github.rest.issues.listComments, {
                 owner: context.repo.owner,
@@ -50,51 +52,57 @@ runs:
                 const previousData = previousDataMatch?.[1] ? JSON.parse(previousDataMatch[1]) : null;
 
                 for (const comment of comments) {
-                  if (comment.author_association != "OWNER" && comment.author_association != "MEMBER") {
-                    continue;
-                  }
-                  const match = comment.body.match(BUGZILLA_REGEX);
-                  if (!match) {
+                  const bzMatch = comment.body.match(BUGZILLA_REGEX);
+                  if (!bzMatch) {
                     continue;
                   }
 
-                  const bugId = match[1];
-                  console.log(`\tFetching Bugzilla data for ${match[0]}`);
+                  if (comment.author_association == 'OWNER' || comment.author_association == 'MEMBER') {
+                    perBugData[bzMatch[1]] = null;
+                  } else if (comment.user.login === 'github-actions[bot]') {
+                    const ghDataMatch = comment.body.match(GH_ACTION_DATA_REGEX);
+                    const ghData = ghDataMatch?.[1] ? JSON.parse(ghDataMatch[1]) : null;
+                    perBugData[bzMatch[1]] = ghData;
+                  }
+                }
+              }
 
-                  const response = await fetch(`https://${process.env.BUGZILLA_HOSTNAME}/rest/bug/${bugId}`);
-                  const data = await response.json();
-                  const bug = data?.bugs?.[0];
+              for (const [bugId, previousData] of Object.entries(perBugData)) {
+                console.log(`\tFetching Bugzilla data for bug ${bugId}`);
 
-                  if (!bug) {
-                    console.log(`\tNo data found for Bugzilla bug ID ${bugId}. Skipping...`);
+                const response = await fetch(`https://${process.env.BUGZILLA_HOSTNAME}/rest/bug/${bugId}`);
+                const data = await response.json();
+                const bug = data?.bugs?.[0];
+
+                if (!bug) {
+                  console.log(`\tNo data found for bug ${bugId}. Skipping...`);
+                  continue;
+                }
+
+                const { resolution, status, target_milestone: targetMilestone, last_change_time: lastChangedDate } = bug;
+
+                if (previousData) {
+                  if (previousData.lastChangedDate === lastChangedDate || (previousData.status === status && previousData.resolution == resolution)) {
+                    console.log(`\tNo changes detected for Bugzilla bug ID ${bugId}. Skipping...`);
                     continue;
                   }
+                }
 
-                  const { resolution, status, target_milestone: targetMilestone, last_change_time: lastChangedDate } = bug;
+                if (status === 'RESOLVED') {
+                  const commentContent =
+                    `Upstream issue [bug ${bugId}](https://${process.env.BUGZILLA_HOSTNAME}/show_bug.cgi?id=${bugId}) has changed to ${status} ${resolution} ` +
+                    `and will be ready for ${bug.product} ${targetMilestone}.\n` +
+                    `<!---GH-ACTION-DATA-${JSON.stringify({ resolution, status, targetMilestone, lastChangedDate })}-GH-ACTION-DATA--->`;
 
-                  if (previousData) {
-                    if (previousData.lastChangedDate === lastChangedDate || (previousData.status === status && previousData.resolution == resolution)) {
-                      console.log(`\tNo changes detected for Bugzilla bug ID ${bugId}. Skipping...`);
-                      continue;
-                    }
-                  }
-
-                  if (status === 'RESOLVED') {
-                    const commentContent =
-                      `Upstream issue [bug ${bugId}](https://${process.env.BUGZILLA_HOSTNAME}/show_bug.cgi?id=${bugId}) has changed to ${status} ${resolution} ` +
-                      `and will be ready for ${bug.product} ${targetMilestone}.\n` +
-                      `<!---GH-ACTION-DATA-${JSON.stringify({ resolution, status, targetMilestone, lastChangedDate })}-GH-ACTION-DATA--->`;
-
-                    console.log(`\tCreating comment on issue #${issue.number} regarding bug ${bugId}'s status...`);
-                    await github.rest.issues.createComment({
-                      owner: context.repo.owner,
-                      repo: context.repo.repo,
-                      issue_number: issue.number,
-                      body: commentContent
-                    });
-                  } else {
-                    console.log(`\tCurrent status is ${status} ${resolution}`);
-                  }
+                  console.log(`\tCreating comment on issue #${issue.number} regarding bug ${bugId}'s status...`);
+                  await github.rest.issues.createComment({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    issue_number: issue.number,
+                    body: commentContent
+                  });
+                } else {
+                  console.log(`\tCurrent status is ${status} ${resolution}`);
                 }
               }
             }
